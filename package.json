@@ -1,4 +1,6 @@
 {
+  "name": "mcu-stremio-list",
+  "version": "1.5.0",
   "dependencies": {
     "stremio-addon-sdk": "^1.6.0",
     "node-fetch": "^2.6.7"
