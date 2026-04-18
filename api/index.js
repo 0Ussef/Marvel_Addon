@@ -5,10 +5,10 @@ const SHEET_URL = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2P
 const TMDB_KEY = "aca5177e4921fcdcb0ece67dc17b5bd0";
 
 const manifest = {
-    id: "org.mcu.poster.fixed",
-    version: "1.6.0",
-    name: "MCU Playable & Poster List",
-    description: "MCU list with real posters and playable streams",
+    id: "org.mcu.numbered.list",
+    version: "1.7.0",
+    name: "MCU Numbered List",
+    description: "Numbered MCU list with real posters and playable streams",
     resources: ["catalog"],
     types: ["movie", "series"],
     catalogs: [{ 
@@ -20,7 +20,6 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// Helper: Get both IMDb ID and Poster Path from TMDB
 async function getTmdbData(title, isSeries) {
     try {
         const type = isSeries ? 'tv' : 'movie';
@@ -32,7 +31,6 @@ async function getTmdbData(title, isSeries) {
             const tmdbId = item.id;
             const posterPath = item.poster_path;
             
-            // Get the IMDb ID (External IDs)
             const extRes = await fetch(`https://api.themoviedb.org/3/${type}/${tmdbId}/external_ids?api_key=${TMDB_KEY}`);
             const extData = await extRes.json();
             
@@ -52,8 +50,8 @@ builder.defineCatalogHandler(async ({ id }) => {
             const text = await res.text();
             const json = JSON.parse(text.substring(47).slice(0, -2));
 
-            // We process the list. Note: fetching posters for 100+ items live can be slow.
-            const metas = await Promise.all(json.table.rows.map(async (r) => {
+            // Use the index (i) to add numbers
+            const metas = await Promise.all(json.table.rows.map(async (r, i) => {
                 const title = r.c[1]?.v?.toString().trim();
                 if (!title) return null;
 
@@ -68,13 +66,13 @@ builder.defineCatalogHandler(async ({ id }) => {
                     finalId = `${tmdb.imdbId}:${parseInt(epMatch[1])}:${parseInt(epMatch[2])}`;
                 }
 
+                // Added # and index to the name property
                 return {
                     id: finalId,
                     type: isSeries ? "series" : "movie",
-                    name: title,
-                    // If TMDB found a poster, use it. Otherwise, use the fallback Marvel logo.
+                    name: `#${i + 1} ${title}`, 
                     poster: tmdb.poster || "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg",
-                    description: isSeries ? `TV Show: ${searchTitle}` : `Movie: ${title}`
+                    description: isSeries ? `Part ${i + 1}: ${searchTitle}` : `Part ${i + 1}: ${title}`
                 };
             }));
 
