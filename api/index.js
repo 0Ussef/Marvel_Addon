@@ -6,22 +6,22 @@ const SHEET_URL = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2P
 const TMDB_KEY = "aca5177e4921fcdcb0ece67dc17b5bd0";
 
 const manifest = {
-    id: "org.mcu.grouped.chrono",
-    version: "2.0.0",
-    name: "MCU Grouped Chrono",
-    description: "Chronological MCU list with grouped episodes and TMDB posters",
+    id: "org.mcu.chronological.grouped",
+    version: "2.1.0",
+    name: "MCU Chrono (Grouped)",
+    description: "Grouped MCU episodes with TMDB posters and playable links",
     resources: ["catalog"],
     types: ["movie", "series"],
     catalogs: [{ 
         type: "movie", 
         id: "mcu_chrono", 
-        name: "MCU: Chronological (Grouped)" 
+        name: "MCU: Chronological" 
     }]
 };
 
 const builder = new addonBuilder(manifest);
 
-// Helper: Get IMDb ID and Poster from TMDB
+// Helper: Fetch IMDb ID and Poster URL from TMDB
 async function getTmdbData(title, isSeries) {
     try {
         const type = isSeries ? 'tv' : 'movie';
@@ -41,7 +41,7 @@ async function getTmdbData(title, isSeries) {
                 poster: posterPath ? `https://image.tmdb.org/t/p/w500${posterPath}` : null
             };
         }
-    } catch (e) { console.error("TMDB Error:", e); }
+    } catch (e) { console.error("TMDB Fetch Error:", e); }
     return { imdbId: null, poster: null };
 }
 
@@ -56,7 +56,7 @@ builder.defineCatalogHandler(async ({ id }) => {
             const groupedItems = [];
             let i = 0;
 
-            // --- GROUPING LOGIC ---
+            // --- THE GROUPING ENGINE ---
             while (i < rows.length) {
                 const title = rows[i].c[1]?.v?.toString().trim();
                 if (!title) { i++; continue; }
@@ -70,7 +70,7 @@ builder.defineCatalogHandler(async ({ id }) => {
                     let episodes = [epMatch[2]];
                     let lastIdx = i;
 
-                    // Look ahead for consecutive episodes of the same show/season
+                    // Scan forward to find consecutive episodes of the same show/season
                     while (lastIdx + 1 < rows.length) {
                         const nextTitle = rows[lastIdx + 1].c[1]?.v?.toString().trim();
                         if (!nextTitle) break;
@@ -94,12 +94,12 @@ builder.defineCatalogHandler(async ({ id }) => {
                         searchTitle: showName,
                         displayName: `${rangeLabel} ${showName} S${season} ${epLabel}`,
                         isSeries: true,
-                        playIdSuffix: `:${season}:${episodes[0]}` // Plays first episode in group
+                        playIdSuffix: `:${season}:${episodes[0]}` // Default playback to first ep in group
                     });
 
                     i = lastIdx + 1;
                 } else {
-                    // Movie handling
+                    // Movie/Special Handling
                     groupedItems.push({
                         searchTitle: title,
                         displayName: `#${i + 1} ${title}`,
@@ -110,23 +110,23 @@ builder.defineCatalogHandler(async ({ id }) => {
                 }
             }
 
-            // Fetch TMDB Data for the unique groups
+            // --- CONVERT TO STREMIO METADATA ---
             const metas = await Promise.all(groupedItems.map(async (item) => {
                 const tmdb = await getTmdbData(item.searchTitle, item.isSeries);
                 const baseId = tmdb.imdbId || `tt_search_${encodeURIComponent(item.searchTitle)}`;
                 
                 return {
                     id: baseId + item.playIdSuffix,
-                    type: "movie", // Set to movie so every group shows as a tile in the grid
+                    type: "movie", // Using "movie" prevents Stremio from merging/hiding episodes
                     name: item.displayName,
                     poster: tmdb.poster || "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg",
-                    description: `MCU Order: ${item.displayName}`
+                    description: `MCU Timeline: ${item.displayName}`
                 };
             }));
 
             return { metas: metas.filter(Boolean) };
         } catch (error) {
-            console.error("Handler Error:", error);
+            console.error("Catalog Handler Error:", error);
             return { metas: [] };
         }
     }
@@ -140,11 +140,10 @@ module.exports = async (req, res) => {
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Content-Type', 'application/json');
 
-    const url = req.url;
-    if (url.endsWith('manifest.json')) return res.json(addonInterface.manifest);
+    if (req.url.endsWith('manifest.json')) return res.json(addonInterface.manifest);
     
-    if (url.includes('/catalog/')) {
-        const match = url.match(/\/catalog\/([^/]+)\/([^/.]+)/);
+    if (req.url.includes('/catalog/')) {
+        const match = req.url.match(/\/catalog\/([^/]+)\/([^/.]+)/);
         if (match) {
             const resp = await addonInterface.get('catalog', match[1], match[2]);
             return res.json(resp);
