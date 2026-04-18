@@ -1,33 +1,43 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 const fetch = require('node-fetch');
 
-// Configuration
 const SHEET_BASE = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2PnEwN7mVawazKmhWJjr_wKs/gviz/tq?tqx=out:json";
-const SHEET_IDS = {
-    mcu_chrono: `${SHEET_BASE}&sheet=Chronological%20Order`,
-    mcu_release: `${SHEET_BASE}&sheet=Release%20Order`,
-    mcu_upcoming: `${SHEET_BASE}&sheet=Upcoming`
+
+// Map Genres to Sheet Tabs
+const GENRE_MAP = {
+    "Chronological": `${SHEET_BASE}&sheet=Chronological%20Order`,
+    "Release Order": `${SHEET_BASE}&sheet=Release%20Order`,
+    "Upcoming": `${SHEET_BASE}&sheet=Upcoming`
 };
 
 const TMDB_KEY = "aca5177e4921fcdcb0ece67dc17b5bd0";
 
 const manifest = {
-    id: "org.mcu.multicatalog.playable",
-    version: "2.5.0",
+    id: "org.mcu.genre.filters",
+    version: "3.0.0",
     name: "MCU Ultimate Watchlist",
-    description: "Chronological, Release, and Upcoming MCU lists with grouped episodes.",
+    description: "MCU lists grouped by Chronological, Release, and Upcoming genres.",
     resources: ["catalog"],
     types: ["movie", "series"],
     catalogs: [
-        { type: "movie", id: "mcu_chrono", name: "MCU: Chronological" },
-        { type: "movie", id: "mcu_release", name: "MCU: Release Order" },
-        { type: "movie", id: "mcu_upcoming", name: "MCU: Upcoming" }
+        { 
+            type: "movie", 
+            id: "mcu_master_list", 
+            name: "MCU Ultimate",
+            // This adds the Genre dropdown in Stremio
+            extra: [
+                {
+                    name: "genre",
+                    options: ["Chronological", "Release Order", "Upcoming"],
+                    isRequired: false
+                }
+            ]
+        }
     ]
 };
 
 const builder = new addonBuilder(manifest);
 
-// Helper: Fetch IMDb ID and Poster from TMDB
 async function getTmdbData(title, isSeries) {
     try {
         const type = isSeries ? 'tv' : 'movie';
@@ -38,7 +48,6 @@ async function getTmdbData(title, isSeries) {
             const item = searchData.results[0];
             const tmdbId = item.id;
             const posterPath = item.poster_path;
-            
             const extRes = await fetch(`https://api.themoviedb.org/3/${type}/${tmdbId}/external_ids?api_key=${TMDB_KEY}`);
             const extData = await extRes.json();
             
@@ -51,8 +60,11 @@ async function getTmdbData(title, isSeries) {
     return { imdbId: null, poster: null };
 }
 
-builder.defineCatalogHandler(async ({ id }) => {
-    const sheetUrl = SHEET_IDS[id];
+builder.defineCatalogHandler(async ({ id, extra }) => {
+    // Default to Chronological if no genre is selected
+    const genre = (extra && extra.genre) ? extra.genre : "Chronological";
+    const sheetUrl = GENRE_MAP[genre];
+    
     if (!sheetUrl) return { metas: [] };
 
     try {
@@ -60,14 +72,12 @@ builder.defineCatalogHandler(async ({ id }) => {
         const text = await res.text();
         const json = JSON.parse(text.substring(47).slice(0, -2));
         
-        // Release Order sheet has a header row at index 0, others might not
-        const isReleaseOrder = id === "mcu_release";
-        const rows = isReleaseOrder ? json.table.rows.slice(1) : json.table.rows;
+        // Skip header for Release Order
+        const rows = (genre === "Release Order") ? json.table.rows.slice(1) : json.table.rows;
 
         const groupedItems = [];
         let i = 0;
 
-        // --- GROUPING ENGINE ---
         while (i < rows.length) {
             const title = rows[i].c[1]?.v?.toString().trim();
             if (!title) { i++; continue; }
@@ -126,13 +136,12 @@ builder.defineCatalogHandler(async ({ id }) => {
                 type: item.isSeries ? "series" : "movie",
                 name: item.displayName,
                 poster: tmdb.poster || "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg",
-                description: `MCU Watchlist: ${item.displayName}`
+                description: `MCU [${genre}]: ${item.displayName}`
             };
         }));
 
         return { metas: metas.filter(Boolean) };
     } catch (error) {
-        console.error("Handler Error:", error);
         return { metas: [] };
     }
 });
@@ -141,16 +150,22 @@ const addonInterface = builder.getInterface();
 
 module.exports = async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Content-Type', 'application/json');
 
     if (req.url.endsWith('manifest.json')) return res.json(addonInterface.manifest);
+    
+    // Updated routing to handle genre queries (?genre=...)
     if (req.url.includes('/catalog/')) {
-        const match = req.url.match(/\/catalog\/([^/]+)\/([^/.]+)/);
-        if (match) {
-            const resp = await addonInterface.get('catalog', match[1], match[2]);
-            return res.json(resp);
-        }
+        const parts = req.url.split('/');
+        const type = parts[2];
+        const idFull = parts[3].replace('.json', '');
+        
+        // Parse the genre from the query string if it exists
+        const queryParams = new URLSearchParams(req.url.split('?')[1]);
+        const genre = queryParams.get('genre');
+
+        const resp = await addonInterface.get('catalog', type, idFull, { genre });
+        return res.json(resp);
     }
     res.status(404).send('Not Found');
 };
