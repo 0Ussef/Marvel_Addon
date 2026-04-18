@@ -1,25 +1,33 @@
 const { addonBuilder } = require('stremio-addon-sdk');
 const fetch = require('node-fetch');
 
-const SHEET_URL = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2PnEwN7mVawazKmhWJjr_wKs/gviz/tq?tqx=out:json&sheet=Chronological%20Order";
+// Configuration
+const SHEET_BASE = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2PnEwN7mVawazKmhWJjr_wKs/gviz/tq?tqx=out:json";
+const SHEET_IDS = {
+    mcu_chrono: `${SHEET_BASE}&sheet=Chronological%20Order`,
+    mcu_release: `${SHEET_BASE}&sheet=Release%20Order`,
+    mcu_upcoming: `${SHEET_BASE}&sheet=Upcoming`
+};
+
 const TMDB_KEY = "aca5177e4921fcdcb0ece67dc17b5bd0";
 
 const manifest = {
-    id: "org.mcu.final.playable",
-    version: "2.2.0",
-    name: "MCU Playable Chrono",
-    description: "Grouped MCU list that actually plays streams",
+    id: "org.mcu.multicatalog.playable",
+    version: "2.5.0",
+    name: "MCU Ultimate Watchlist",
+    description: "Chronological, Release, and Upcoming MCU lists with grouped episodes.",
     resources: ["catalog"],
     types: ["movie", "series"],
-    catalogs: [{ 
-        type: "movie", 
-        id: "mcu_chrono", 
-        name: "MCU: Chronological" 
-    }]
+    catalogs: [
+        { type: "movie", id: "mcu_chrono", name: "MCU: Chronological" },
+        { type: "movie", id: "mcu_release", name: "MCU: Release Order" },
+        { type: "movie", id: "mcu_upcoming", name: "MCU: Upcoming" }
+    ]
 };
 
 const builder = new addonBuilder(manifest);
 
+// Helper: Fetch IMDb ID and Poster from TMDB
 async function getTmdbData(title, isSeries) {
     try {
         const type = isSeries ? 'tv' : 'movie';
@@ -44,85 +52,89 @@ async function getTmdbData(title, isSeries) {
 }
 
 builder.defineCatalogHandler(async ({ id }) => {
-    if (id === "mcu_chrono") {
-        try {
-            const res = await fetch(SHEET_URL);
-            const text = await res.text();
-            const json = JSON.parse(text.substring(47).slice(0, -2));
-            const rows = json.table.rows;
+    const sheetUrl = SHEET_IDS[id];
+    if (!sheetUrl) return { metas: [] };
 
-            const groupedItems = [];
-            let i = 0;
+    try {
+        const res = await fetch(sheetUrl);
+        const text = await res.text();
+        const json = JSON.parse(text.substring(47).slice(0, -2));
+        
+        // Release Order sheet has a header row at index 0, others might not
+        const isReleaseOrder = id === "mcu_release";
+        const rows = isReleaseOrder ? json.table.rows.slice(1) : json.table.rows;
 
-            while (i < rows.length) {
-                const title = rows[i].c[1]?.v?.toString().trim();
-                if (!title) { i++; continue; }
+        const groupedItems = [];
+        let i = 0;
 
-                const epMatch = title.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
-                
-                if (epMatch) {
-                    const showName = title.split(/Season \d+/i)[0].trim();
-                    const season = epMatch[1];
-                    const startIndex = i + 1;
-                    let episodes = [epMatch[2]];
-                    let lastIdx = i;
+        // --- GROUPING ENGINE ---
+        while (i < rows.length) {
+            const title = rows[i].c[1]?.v?.toString().trim();
+            if (!title) { i++; continue; }
 
-                    while (lastIdx + 1 < rows.length) {
-                        const nextTitle = rows[lastIdx + 1].c[1]?.v?.toString().trim();
-                        if (!nextTitle) break;
-                        const nextMatch = nextTitle.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
-                        const nextShowName = nextTitle.split(/Season \d+/i)[0].trim();
+            const epMatch = title.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
+            
+            if (epMatch) {
+                const showName = title.split(/Season \d+/i)[0].trim();
+                const season = epMatch[1];
+                const startIndex = i + 1;
+                let episodes = [epMatch[2]];
+                let lastIdx = i;
 
-                        if (nextMatch && nextShowName === showName && nextMatch[1] === season) {
-                            episodes.push(nextMatch[2]);
-                            lastIdx++;
-                        } else {
-                            break;
-                        }
+                while (lastIdx + 1 < rows.length) {
+                    const nextTitle = rows[lastIdx + 1].c[1]?.v?.toString().trim();
+                    if (!nextTitle) break;
+                    const nextMatch = nextTitle.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
+                    const nextShowName = nextTitle.split(/Season \d+/i)[0].trim();
+
+                    if (nextMatch && nextShowName === showName && nextMatch[1] === season) {
+                        episodes.push(nextMatch[2]);
+                        lastIdx++;
+                    } else {
+                        break;
                     }
-
-                    const endIndex = lastIdx + 1;
-                    const rangeLabel = startIndex === endIndex ? `#${startIndex}` : `#${startIndex}-${endIndex}`;
-                    const epLabel = episodes.length > 1 ? `Ep ${episodes[0]}-${episodes[episodes.length - 1]}` : `Ep ${episodes[0]}`;
-
-                    groupedItems.push({
-                        searchTitle: showName,
-                        displayName: `${rangeLabel} ${showName} S${season} ${epLabel}`,
-                        isSeries: true,
-                        playIdSuffix: `:${season}:${episodes[0]}`
-                    });
-                    i = lastIdx + 1;
-                } else {
-                    groupedItems.push({
-                        searchTitle: title,
-                        displayName: `#${i + 1} ${title}`,
-                        isSeries: false,
-                        playIdSuffix: ""
-                    });
-                    i++;
                 }
+
+                const endIndex = lastIdx + 1;
+                const rangeLabel = startIndex === endIndex ? `#${startIndex}` : `#${startIndex}-${endIndex}`;
+                const epLabel = episodes.length > 1 ? `Ep ${episodes[0]}-${episodes[episodes.length - 1]}` : `Ep ${episodes[0]}`;
+
+                groupedItems.push({
+                    searchTitle: showName,
+                    displayName: `${rangeLabel} ${showName} S${season} ${epLabel}`,
+                    isSeries: true,
+                    playIdSuffix: `:${season}:${episodes[0]}`
+                });
+                i = lastIdx + 1;
+            } else {
+                groupedItems.push({
+                    searchTitle: title,
+                    displayName: `#${i + 1} ${title}`,
+                    isSeries: false,
+                    playIdSuffix: ""
+                });
+                i++;
             }
-
-            const metas = await Promise.all(groupedItems.map(async (item) => {
-                const tmdb = await getTmdbData(item.searchTitle, item.isSeries);
-                const baseId = tmdb.imdbId || `tt_search_${encodeURIComponent(item.searchTitle)}`;
-                
-                return {
-                    id: baseId + item.playIdSuffix,
-                    // IMPORTANT: Type must match the ID format for streams to load
-                    type: item.isSeries ? "series" : "movie",
-                    name: item.displayName,
-                    poster: tmdb.poster || "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg",
-                    description: `MCU Chronological Order: ${item.displayName}`
-                };
-            }));
-
-            return { metas: metas.filter(Boolean) };
-        } catch (error) {
-            return { metas: [] };
         }
+
+        const metas = await Promise.all(groupedItems.map(async (item) => {
+            const tmdb = await getTmdbData(item.searchTitle, item.isSeries);
+            const baseId = tmdb.imdbId || `tt_search_${encodeURIComponent(item.searchTitle)}`;
+            
+            return {
+                id: baseId + item.playIdSuffix,
+                type: item.isSeries ? "series" : "movie",
+                name: item.displayName,
+                poster: tmdb.poster || "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg",
+                description: `MCU Watchlist: ${item.displayName}`
+            };
+        }));
+
+        return { metas: metas.filter(Boolean) };
+    } catch (error) {
+        console.error("Handler Error:", error);
+        return { metas: [] };
     }
-    return { metas: [] };
 });
 
 const addonInterface = builder.getInterface();
