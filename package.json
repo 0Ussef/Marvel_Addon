@@ -1,6 +1,6 @@
 {
-  "name": "mcu-grouped-addon",
-  "version": "2.0.0",
+  "name": "mcu-playable-grouped",
+  "version": "2.2.0",
   "dependencies": {
     "stremio-addon-sdk": "^1.6.0",
     "node-fetch": "^2.6.7"
