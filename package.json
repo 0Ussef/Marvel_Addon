@@ -1,8 +1,9 @@
+
 {
   "name": "mcu-playable-grouped",
   "version": "2.2.0",
   "dependencies": {
-    "stremio-addon-sdk": "^1.6.0",
+    "stremio-addon-sdk": "^1.6.10",
     "node-fetch": "^2.6.7"
   }
 }
