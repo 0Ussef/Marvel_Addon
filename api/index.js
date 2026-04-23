@@ -1,5 +1,5 @@
 const { addonBuilder } = require('stremio-addon-sdk');
-const fetch = require('node-fetch'); // Ensure you are using version 2 (npm install node-fetch@2)
+const fetch = require('node-fetch');
 
 const SHEET_BASE = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2PnEwN7mVawazKmhWJjr_wKs/gviz/tq?tqx=out:json";
 
@@ -13,7 +13,7 @@ const TMDB_KEY = "aca5177e4921fcdcb0ece67dc17b5bd0";
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.2.0",
+    version: "3.2.1",
     name: "MCU Ultimate Watchlist",
     description: "Stable MCU list with Year-Aware TMDB Search",
     resources: ["catalog"],
@@ -30,14 +30,12 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// Helper: Extract Year from Sheet Date logic
 function extractYear(dateStr) {
     if (!dateStr) return null;
     const match = dateStr.match(/\d{4}/);
     return match ? match[0] : null;
 }
 
-// TMDB SEARCH: Uses Year to prevent "Defenders 1961" issue
 async function getTmdbData(title, isSeries, year) {
     try {
         const type = isSeries ? 'tv' : 'movie';
@@ -52,9 +50,7 @@ async function getTmdbData(title, isSeries, year) {
         const searchData = await searchRes.json();
         
         if (searchData.results && searchData.results.length > 0) {
-            // Sort by popularity just in case multiple matches exist for the same year
             const item = searchData.results.sort((a, b) => b.popularity - a.popularity)[0];
-            
             const extRes = await fetch(`https://api.themoviedb.org/3/${type}/${item.id}/external_ids?api_key=${TMDB_KEY}`);
             const extData = await extRes.json();
             
@@ -77,7 +73,6 @@ builder.defineCatalogHandler(async ({ extra }) => {
         const res = await fetch(sheetUrl);
         const text = await res.text();
         
-        // Safety check for the Google Sheets JSON wrapper
         if (!text.includes("google.visualization.Query.setResponse")) {
             throw new Error("Invalid Google Sheets response");
         }
@@ -87,34 +82,44 @@ builder.defineCatalogHandler(async ({ extra }) => {
 
         const metas = await Promise.all(rows.map(async (row, index) => {
             try {
-                // Safely access row data to prevent "Cannot read property of undefined" crashes
                 const title = row.c && row.c[1] ? row.c[1].v?.toString().trim() : null;
                 const rawDate = row.c && row.c[2] ? (row.c[2].f || row.c[2].v?.toString()) : null;
                 
                 if (!title) return null;
 
                 const year = extractYear(rawDate);
-                const isSeries = /Season \d+.*Episode \d+/i.test(title);
+                const epMatch = title.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
+                const isSeries = !!epMatch;
+                
+                // For TMDB search: strip the Season/Episode info to find the show poster
                 const showName = isSeries ? title.split(/Season \d+/i)[0].trim() : title;
 
                 const tmdb = await getTmdbData(showName, isSeries, year);
                 const baseId = tmdb.imdbId || `tt_local_${index}`;
                 
                 let id = baseId;
+                let displayName = `#${index + 1} ${title}`;
+
                 if (isSeries) {
-                    const epMatch = title.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
-                    if (epMatch) id += `:${epMatch[1]}:${epMatch[2]}`;
+                    const seasonNum = epMatch[1];
+                    const episodeNum = epMatch[2];
+                    
+                    // Specific requested format: #1 E:1 Eyes of Wakanda Season 1 Episode 1...
+                    displayName = `#${index + 1} E:${episodeNum} ${title}`;
+                    
+                    // Append S:E to ID for Stremio routing
+                    id += `:${seasonNum}:${episodeNum}`;
                 }
 
                 return {
                     id: id,
                     type: isSeries ? "series" : "movie",
-                    name: `#${index + 1} ${title}`,
+                    name: displayName,
                     poster: tmdb.poster || "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg",
                     description: `MCU ${genre} • ${year || 'Release date unknown'}`
                 };
             } catch (err) {
-                return null; // Skip individual row errors
+                return null;
             }
         }));
 
