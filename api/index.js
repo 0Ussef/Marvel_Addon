@@ -257,4 +257,6 @@ module.exports = async (req, res) => {
 
     } catch (err) {
         console.error("Handler Error:", err.message);
-        return res.status(500).json({ error: "Internal Server 
+        return res.status(500).json({ error: "Internal Server Error" });
+    }
+};
