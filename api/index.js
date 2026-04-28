@@ -11,10 +11,11 @@ const GENRE_MAP = {
 
 const TMDB_KEY = "aca5177e4921fcdcb0ece67dc17b5bd0";
 const DEFAULT_POSTER = "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg";
+const TMDB_LOW_CONFIDENCE_THRESHOLD = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.2.2",
+    version: "3.2.3",
     name: "MCU Ultimate Watchlist",
     description: "Stable MCU list with Year-Aware TMDB Search",
     resources: ["catalog"],
@@ -37,7 +38,7 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function extractYear(dateStr) {
     if (!dateStr) return null;
@@ -45,54 +46,146 @@ function extractYear(dateStr) {
     return match ? match[0] : null;
 }
 
-/**
- * FIX #2 & #5:
- * - Try search WITH year first; if 0 results, retry WITHOUT year.
- *   Episode air dates often differ from a show's premiere year, so the
- *   year-filtered query would return nothing for those rows.
- * - Sort by vote_count instead of popularity. Popularity is volatile and
- *   skews toward whatever's trending, causing unrelated hit shows to
- *   outrank obscure MCU Disney+ entries.
- */
-async function getTmdbData(title, isSeries, year) {
-    const type     = isSeries ? 'tv' : 'movie';
-    const yearParam = isSeries ? "first_air_date_year" : "primary_release_year";
+// ─── Title Parser ─────────────────────────────────────────────────────────────
+// Handles all series formats generically without assuming show names.
 
-    const trySearch = async (includeYear) => {
+function parseTitle(title) {
+    // "ShowName Slingshot Episode N" — Slingshot is a sub-series, not a season
+    const slingshotMatch = title.match(/^(.+?)\s+Slingshot\s+Episode\s+(\d+)/i);
+    if (slingshotMatch) {
+        return {
+            showName: `${slingshotMatch[1].trim()}: Slingshot`,
+            isSeries: true,
+            season: "1",
+            episode: slingshotMatch[2]
+        };
+    }
+
+    // "ShowName Season X Episode Y: Optional Episode Title"
+    const epMatch = title.match(/^(.+?)\s+Season\s+(\d+)\s+Episode\s+(\d+)/i);
+    if (epMatch) {
+        return {
+            showName: epMatch[1].trim(),
+            isSeries: true,
+            season: epMatch[2],
+            episode: epMatch[3]
+        };
+    }
+
+    return { showName: title, isSeries: false, season: null, episode: null };
+}
+
+// ─── TMDB Search — confidence-aware ──────────────────────────────────────────
+// For MOVIES: use year to disambiguate, retry without year on miss.
+// For SERIES: never filter by year (episode air dates ≠ show premiere year).
+// Confidence is LOW when vote_count < threshold — likely wrong match or promo.
+
+async function getTmdbData(title, isSeries, year) {
+    const type = isSeries ? 'tv' : 'movie';
+
+    const search = async (withYear) => {
         let url = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_KEY}&query=${encodeURIComponent(title)}`;
-        if (includeYear && year) url += `&${yearParam}=${year}`;
+        if (!isSeries && withYear && year) url += `&primary_release_year=${year}`;
         const res  = await fetch(url);
         const data = await res.json();
         return data.results || [];
     };
 
     try {
-        let results = year ? await trySearch(true) : [];
+        let results = await search(true);
 
-        // Retry without year constraint if nothing found
-        if (results.length === 0) results = await trySearch(false);
-        if (results.length === 0) return { imdbId: null, poster: null };
+        // Movie-only: retry without year if nothing found
+        if (!isSeries && results.length === 0 && year) {
+            results = await search(false);
+        }
 
-        // Prefer the most-voted result — more stable than popularity for niche titles
+        if (results.length === 0) {
+            return { imdbId: null, poster: null, confident: false };
+        }
+
+        // Sort by vote_count — most stable signal for correct match
         const item = results.sort((a, b) => b.vote_count - a.vote_count)[0];
+
+        // Low vote count = likely wrong match or promo/obscure web content
+        const confident = (item.vote_count ?? 0) >= TMDB_LOW_CONFIDENCE_THRESHOLD;
+
+        if (!confident) {
+            console.warn(`[LOW CONFIDENCE] "${title}" — top result vote_count: ${item.vote_count}, name: ${item.title || item.name}`);
+            return { imdbId: null, poster: null, confident: false };
+        }
 
         const extRes  = await fetch(`https://api.themoviedb.org/3/${type}/${item.id}/external_ids?api_key=${TMDB_KEY}`);
         const extData = await extRes.json();
 
         return {
             imdbId: extData.imdb_id || null,
-            poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null
+            poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
+            confident: true
         };
+
     } catch (e) {
-        console.error(`TMDB Search Error for "${title}":`, e.message);
-        return { imdbId: null, poster: null };
+        console.error(`TMDB Error for "${title}":`, e.message);
+        return { imdbId: null, poster: null, confident: false };
     }
 }
 
-// ─── Catalog Handler ─────────────────────────────────────────────────────────
+// ─── Row Processor ────────────────────────────────────────────────────────────
+
+async function processRow(row, index, genre) {
+    try {
+        const rawTitle = row.c?.[1]?.v?.toString().trim() ?? null;
+        const rawDate  = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString()) : null;
+
+        if (!rawTitle) return null;
+
+        const year = extractYear(rawDate);
+
+        // Filter out anything with a known release year before 1990
+        if (year && parseInt(year) < 1990) {
+            console.log(`[FILTERED] "${rawTitle}" — year ${year} is before 1990`);
+            return null;
+        }
+
+        const { showName, isSeries, season, episode } = parseTitle(rawTitle);
+        const tmdb = await getTmdbData(showName, isSeries, year);
+
+        // No confident TMDB match — treat as promo/supplemental content.
+        // Use a placeholder ID so it still appears in the catalog without
+        // risking loading the wrong stream via a bad IMDB ID.
+        const baseId = (tmdb.confident && tmdb.imdbId)
+            ? tmdb.imdbId
+            : `promo_${index}`;
+
+        if (!tmdb.confident) {
+            console.log(`[PROMO/UNMATCHED] "${rawTitle}" — shown with placeholder ID`);
+        }
+
+        let id          = baseId;
+        let displayName = `#${index + 1} ${rawTitle}`;
+
+        if (isSeries && season && episode) {
+            displayName = `#${index + 1} E:${episode} ${rawTitle}`;
+            id          = `${baseId}:${season}:${episode}`;
+        }
+
+        return {
+            id,
+            type: isSeries ? "series" : "movie",
+            name: displayName,
+            poster: tmdb.poster || DEFAULT_POSTER,
+            description: `MCU ${genre} • ${year ?? 'Release date unknown'}`
+        };
+
+    } catch (err) {
+        console.error(`Row ${index} processing error:`, err.message);
+        return null;
+    }
+}
+
+// ─── Catalog Handler ──────────────────────────────────────────────────────────
 
 builder.defineCatalogHandler(async ({ extra }) => {
-    // FIX #1: Validate genre before using it — never let null/unknown slip through
+    // Validate genre — never let null or unknown value through
     const genre = (extra && extra.genre && GENRE_MAP[extra.genre])
         ? extra.genre
         : "Chronological";
@@ -110,61 +203,14 @@ builder.defineCatalogHandler(async ({ extra }) => {
         const json    = JSON.parse(text.substring(47).slice(0, -2));
         const allRows = json.table.rows;
 
-        // FIX #4: Detect header rows dynamically instead of a hardcoded slice(1).
-        // Header rows have no year in column 2; real data rows do (or have an empty date).
+        // Dynamically skip header rows — they have no 4-digit year in column 2
         const rows = allRows.filter((row) => {
             const col2 = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
-            // Keep rows that have a 4-digit year OR have no date at all (Upcoming items)
             return /\d{4}/.test(col2) || col2 === "";
         });
 
         const metas = await Promise.all(
-            rows.map(async (row, index) => {
-                try {
-                    const title   = row.c?.[1]?.v?.toString().trim() ?? null;
-                    const rawDate = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString()) : null;
-
-                    if (!title) return null;
-
-                    const year     = extractYear(rawDate);
-                    const epMatch  = title.match(/Season\s+(\d+)\s+Episode\s+(\d+)/i);
-                    const isSeries = !!epMatch;
-
-                    // Strip episode info to search for the show itself
-                    const showName = isSeries
-                        ? title.split(/Season\s+\d+/i)[0].trim()
-                        : title;
-
-                    const tmdb = await getTmdbData(showName, isSeries, year);
-
-                    // FIX #3: Log missing IDs; use a clearly-labelled fallback instead
-                    // of tt_local_ which silently breaks stream resolution in Stremio.
-                    if (!tmdb.imdbId) {
-                        console.warn(`[NO IMDB ID] "${title}" (year: ${year ?? 'unknown'})`);
-                    }
-
-                    const baseId      = tmdb.imdbId || `tt_missing_${index}`;
-                    let   id          = baseId;
-                    let   displayName = `#${index + 1} ${title}`;
-
-                    if (isSeries && epMatch) {
-                        const [, seasonNum, episodeNum] = epMatch;
-                        displayName = `#${index + 1} E:${episodeNum} ${title}`;
-                        id          = `${baseId}:${seasonNum}:${episodeNum}`;
-                    }
-
-                    return {
-                        id,
-                        type: isSeries ? "series" : "movie",
-                        name: displayName,
-                        poster: tmdb.poster || DEFAULT_POSTER,
-                        description: `MCU ${genre} • ${year ?? 'Release date unknown'}`
-                    };
-                } catch (err) {
-                    console.error(`Row ${index} processing error:`, err.message);
-                    return null;
-                }
-            })
+            rows.map((row, index) => processRow(row, index, genre))
         );
 
         return { metas: metas.filter(Boolean) };
@@ -175,7 +221,7 @@ builder.defineCatalogHandler(async ({ extra }) => {
     }
 });
 
-// ─── HTTP / Vercel Handler ───────────────────────────────────────────────────
+// ─── HTTP / Vercel Handler ────────────────────────────────────────────────────
 
 const addonInterface = builder.getInterface();
 
@@ -186,29 +232,29 @@ module.exports = async (req, res) => {
     try {
         const url = req.url || '';
 
-        // ── Manifest ──────────────────────────────────────────────────────
+        // Manifest
         if (url.endsWith('manifest.json')) {
             return res.status(200).json(addonInterface.manifest);
         }
 
-        // ── Catalog ───────────────────────────────────────────────────────
+        // Catalog
         if (url.includes('/catalog/')) {
-            // FIX #1: Stremio encodes extra params in the URL path like:
-            //   /catalog/movie/mcu_master_list/genre=Release%20Order.json
-            // It may also use a query string. Check both.
             let genre = null;
 
+            // Stremio encodes extra params in the path:
+            // /catalog/movie/mcu_master_list/genre=Chronological.json
             const pathMatch = url.match(/\/genre=([^\/\?&]+)/);
             if (pathMatch) {
                 genre = decodeURIComponent(pathMatch[1].replace(/\.json$/, ''));
             }
 
+            // Fallback to query string
             if (!genre) {
                 const qs = url.split('?')[1] || '';
                 genre    = new URLSearchParams(qs).get('genre');
             }
 
-            // Final validation — never forward an invalid genre to the handler
+            // Final validation
             if (!genre || !GENRE_MAP[genre]) genre = "Chronological";
 
             console.log(`[Catalog Request] genre="${genre}"`);
@@ -217,7 +263,7 @@ module.exports = async (req, res) => {
                 'catalog',
                 'movie',
                 'mcu_master_list',
-                { genre }       // always a valid, non-null string
+                { genre }
             );
 
             return res.status(200).json(resp);
