@@ -19,16 +19,16 @@ const CATALOGS = {
 };
 
 const TMDB_KEY             = "aca5177e4921fcdcb0ece67dc17b5bd0";
-const RPDB_KEY             = "t0-free";
+// Updated to the specific RPDB style requested
+const RPDB_ENDPOINT        = "https://api.ratingposterdb.com/t0-free-rpdb-rounded-blocks/imdb/poster-default";
 const DEFAULT_POSTER       = "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg";
 const TMDB_LOW_CONFIDENCE  = 10;
 
 // ─── Manifest ─────────────────────────────────────────────────────────────────
-// One catalog entry per sheet — Stremio shows them as separate rows in Discover.
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.3.0",
+    version: "3.3.1",
     name: "MCU Ultimate Watchlist",
     description: "MCU lists: Chronological, Release Order, and Upcoming",
     resources: ["catalog"],
@@ -52,7 +52,8 @@ function extractYear(dateStr) {
 
 function getRpdbPoster(imdbId) {
     if (!imdbId || imdbId.startsWith('promo_')) return null;
-    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${imdbId}.jpg?fallback=true`;
+    // Updated URL format
+    return `${RPDB_ENDPOINT}/${imdbId}.jpg`;
 }
 
 // ─── Title Parser ─────────────────────────────────────────────────────────────
@@ -103,7 +104,6 @@ async function getTmdbData(title, isSeries, year) {
         const confident = (item.vote_count ?? 0) >= TMDB_LOW_CONFIDENCE;
 
         if (!confident) {
-            console.warn(`[LOW CONFIDENCE] "${title}" — vote_count: ${item.vote_count}`);
             return { imdbId: null, poster: null, confident: false };
         }
 
@@ -116,7 +116,6 @@ async function getTmdbData(title, isSeries, year) {
             confident: true
         };
     } catch (e) {
-        console.error(`TMDB Error for "${title}":`, e.message);
         return { imdbId: null, poster: null, confident: false };
     }
 }
@@ -131,12 +130,6 @@ async function processRow(row, index, catalogName) {
         if (!rawTitle) return null;
 
         const year = extractYear(rawDate);
-
-        if (year && parseInt(year) < 1990) {
-            console.log(`[FILTERED] "${rawTitle}" — year ${year} before 1990`);
-            return null;
-        }
-
         const { showName, isSeries, season, episode } = parseTitle(rawTitle);
         const tmdb = await getTmdbData(showName, isSeries, year);
 
@@ -144,11 +137,8 @@ async function processRow(row, index, catalogName) {
             ? tmdb.imdbId
             : `promo_${index}`;
 
-        if (!tmdb.confident) {
-            console.log(`[PROMO/UNMATCHED] "${rawTitle}" — placeholder ID`);
-        }
-
         let id          = baseId;
+        // Index + 1 ensures the first visible item starts at #1
         let displayName = `#${index + 1} ${rawTitle}`;
 
         if (isSeries && season && episode) {
@@ -156,7 +146,6 @@ async function processRow(row, index, catalogName) {
             id          = `${baseId}:${season}:${episode}`;
         }
 
-        // Poster priority: RPDB → TMDB → default
         const poster = getRpdbPoster(tmdb.imdbId) || tmdb.poster || DEFAULT_POSTER;
 
         return {
@@ -164,11 +153,10 @@ async function processRow(row, index, catalogName) {
             type: isSeries ? "series" : "movie",
             name: displayName,
             poster,
-            description: `MCU ${catalogName} • ${year ?? 'Release date unknown'}`
+            description: `MCU ${catalogName} • ${year ?? 'TBA'}`
         };
 
     } catch (err) {
-        console.error(`Row ${index} error:`, err.message);
         return null;
     }
 }
@@ -189,10 +177,16 @@ async function fetchCatalog(catalogId) {
     const json    = JSON.parse(text.substring(47).slice(0, -2));
     const allRows = json.table.rows;
 
-    // Skip header rows — they have no 4-digit year in column 2
+    // Filter out headers: Must have a title in Col 1 AND (a year in Col 2 OR it's the 'Upcoming' sheet)
     const rows = allRows.filter((row) => {
-        const col2 = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
-        return /\d{4}/.test(col2) || col2 === "";
+        const title = row.c?.[1]?.v?.toString().trim() || "";
+        const date  = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
+        
+        const hasYear = /\d{4}/.test(date);
+        const isLegitTitle = title.length > 0 && !title.toLowerCase().includes("phase");
+
+        // "Upcoming" sheet might not have years yet, others usually do
+        return catalogId === "mcu_upcoming" ? isLegitTitle : (isLegitTitle && hasYear);
     });
 
     const metas = await Promise.all(
@@ -205,18 +199,11 @@ async function fetchCatalog(catalogId) {
 // ─── Catalog Handler ──────────────────────────────────────────────────────────
 
 builder.defineCatalogHandler(async (args) => {
-    console.log(`[Catalog Request] id="${args.id}"`);
-
-    if (!CATALOGS[args.id]) {
-        console.warn(`[Unknown catalog] "${args.id}"`);
-        return { metas: [] };
-    }
-
+    if (!CATALOGS[args.id]) return { metas: [] };
     try {
         const metas = await fetchCatalog(args.id);
         return { metas };
     } catch (error) {
-        console.error(`Catalog Handler Error [${args.id}]:`, error.message);
         return { metas: [] };
     }
 });
@@ -237,17 +224,12 @@ module.exports = async (req, res) => {
         }
 
         if (url.includes('/catalog/')) {
-            // Path format: /catalog/movie/{catalogId}.json
-            // or with extras: /catalog/movie/{catalogId}/skip=0.json
             const idMatch = url.match(/\/catalog\/movie\/([^\/\?]+?)(?:\/|\.json)/);
             const catalogId = idMatch ? decodeURIComponent(idMatch[1]) : null;
 
             if (!catalogId || !CATALOGS[catalogId]) {
-                console.warn(`[Unknown catalog path] "${url}"`);
                 return res.status(200).json({ metas: [] });
             }
-
-            console.log(`[HTTP Catalog Request] catalogId="${catalogId}"`);
 
             const resp = await addonInterface.get('catalog', 'movie', catalogId, {});
             return res.status(200).json(resp);
@@ -256,7 +238,6 @@ module.exports = async (req, res) => {
         return res.status(404).json({ error: "Not Found" });
 
     } catch (err) {
-        console.error("Handler Error:", err.message);
         return res.status(500).json({ error: "Internal Server Error" });
     }
 };
