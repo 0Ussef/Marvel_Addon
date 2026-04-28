@@ -3,43 +3,46 @@ const fetch = require('node-fetch');
 
 const SHEET_BASE = "https://docs.google.com/spreadsheets/d/1Xfe--9Wshbb3ru0JplA2PnEwN7mVawazKmhWJjr_wKs/gviz/tq?tqx=out:json";
 
-const GENRE_MAP = {
-    "Chronological": `${SHEET_BASE}&sheet=Chronological%20Order`,
-    "Release Order": `${SHEET_BASE}&sheet=Release%20Order`,
-    "Upcoming":      `${SHEET_BASE}&sheet=Upcoming`
+const CATALOGS = {
+    "mcu_chronological": {
+        name: "MCU Chronological",
+        url: `${SHEET_BASE}&sheet=Chronological%20Order`
+    },
+    "mcu_release": {
+        name: "MCU Release Order",
+        url: `${SHEET_BASE}&sheet=Release%20Order`
+    },
+    "mcu_upcoming": {
+        name: "MCU Upcoming",
+        url: `${SHEET_BASE}&sheet=Upcoming`
+    }
 };
 
-const TMDB_KEY    = "aca5177e4921fcdcb0ece67dc17b5bd0";
-const RPDB_KEY    = "t0-free";                                          // ← RPDB free tier
-const DEFAULT_POSTER = "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg";
-const TMDB_LOW_CONFIDENCE_THRESHOLD = 10;
+const TMDB_KEY             = "aca5177e4921fcdcb0ece67dc17b5bd0";
+const RPDB_KEY             = "t0-free";
+const DEFAULT_POSTER       = "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg";
+const TMDB_LOW_CONFIDENCE  = 10;
+
+// ─── Manifest ─────────────────────────────────────────────────────────────────
+// One catalog entry per sheet — Stremio shows them as separate rows in Discover.
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.2.3",
+    version: "3.3.0",
     name: "MCU Ultimate Watchlist",
-    description: "Stable MCU list with Year-Aware TMDB Search",
+    description: "MCU lists: Chronological, Release Order, and Upcoming",
     resources: ["catalog"],
     types: ["movie", "series"],
-    catalogs: [
-        {
-            type: "movie",
-            id: "mcu_master_list",
-            name: "MCU Ultimate",
-            extra: [
-                {
-                    name: "genre",
-                    options: ["Chronological", "Release Order", "Upcoming"],
-                    isRequired: false
-                }
-            ]
-        }
-    ]
+    catalogs: Object.entries(CATALOGS).map(([id, { name }]) => ({
+        type: "movie",
+        id,
+        name
+    }))
 };
 
 const builder = new addonBuilder(manifest);
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractYear(dateStr) {
     if (!dateStr) return null;
@@ -47,13 +50,9 @@ function extractYear(dateStr) {
     return match ? match[0] : null;
 }
 
-// ─── RPDB Poster ──────────────────────────────────────────────────────────────
-// Returns a rounded-blocks RPDB poster URL for a given IMDB ID.
-// Falls back to null if the ID is missing or not a real IMDB ID.
-
 function getRpdbPoster(imdbId) {
     if (!imdbId || imdbId.startsWith('promo_')) return null;
-    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${imdbId}.jpg?rounded-blocks`;
+    return `https://api.ratingposterdb.com/${RPDB_KEY}/imdb/poster-default/${imdbId}.jpg?fallback=true`;
 }
 
 // ─── Title Parser ─────────────────────────────────────────────────────────────
@@ -82,7 +81,7 @@ function parseTitle(title) {
     return { showName: title, isSeries: false, season: null, episode: null };
 }
 
-// ─── TMDB Search — confidence-aware ──────────────────────────────────────────
+// ─── TMDB Search ──────────────────────────────────────────────────────────────
 
 async function getTmdbData(title, isSeries, year) {
     const type = isSeries ? 'tv' : 'movie';
@@ -97,20 +96,14 @@ async function getTmdbData(title, isSeries, year) {
 
     try {
         let results = await search(true);
-
-        if (!isSeries && results.length === 0 && year) {
-            results = await search(false);
-        }
-
-        if (results.length === 0) {
-            return { imdbId: null, poster: null, confident: false };
-        }
+        if (!isSeries && results.length === 0 && year) results = await search(false);
+        if (results.length === 0) return { imdbId: null, poster: null, confident: false };
 
         const item      = results.sort((a, b) => b.vote_count - a.vote_count)[0];
-        const confident = (item.vote_count ?? 0) >= TMDB_LOW_CONFIDENCE_THRESHOLD;
+        const confident = (item.vote_count ?? 0) >= TMDB_LOW_CONFIDENCE;
 
         if (!confident) {
-            console.warn(`[LOW CONFIDENCE] "${title}" — top result vote_count: ${item.vote_count}, name: ${item.title || item.name}`);
+            console.warn(`[LOW CONFIDENCE] "${title}" — vote_count: ${item.vote_count}`);
             return { imdbId: null, poster: null, confident: false };
         }
 
@@ -122,7 +115,6 @@ async function getTmdbData(title, isSeries, year) {
             poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
             confident: true
         };
-
     } catch (e) {
         console.error(`TMDB Error for "${title}":`, e.message);
         return { imdbId: null, poster: null, confident: false };
@@ -131,7 +123,7 @@ async function getTmdbData(title, isSeries, year) {
 
 // ─── Row Processor ────────────────────────────────────────────────────────────
 
-async function processRow(row, index, genre) {
+async function processRow(row, index, catalogName) {
     try {
         const rawTitle = row.c?.[1]?.v?.toString().trim() ?? null;
         const rawDate  = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString()) : null;
@@ -141,7 +133,7 @@ async function processRow(row, index, genre) {
         const year = extractYear(rawDate);
 
         if (year && parseInt(year) < 1990) {
-            console.log(`[FILTERED] "${rawTitle}" — year ${year} is before 1990`);
+            console.log(`[FILTERED] "${rawTitle}" — year ${year} before 1990`);
             return null;
         }
 
@@ -153,7 +145,7 @@ async function processRow(row, index, genre) {
             : `promo_${index}`;
 
         if (!tmdb.confident) {
-            console.log(`[PROMO/UNMATCHED] "${rawTitle}" — shown with placeholder ID`);
+            console.log(`[PROMO/UNMATCHED] "${rawTitle}" — placeholder ID`);
         }
 
         let id          = baseId;
@@ -164,57 +156,67 @@ async function processRow(row, index, genre) {
             id          = `${baseId}:${season}:${episode}`;
         }
 
-        // ── Poster priority: RPDB → TMDB → default ──────────────────────────
-        const rpdbPoster = getRpdbPoster(tmdb.imdbId);
-        const poster     = rpdbPoster || tmdb.poster || DEFAULT_POSTER;
+        // Poster priority: RPDB → TMDB → default
+        const poster = getRpdbPoster(tmdb.imdbId) || tmdb.poster || DEFAULT_POSTER;
 
         return {
             id,
             type: isSeries ? "series" : "movie",
             name: displayName,
             poster,
-            description: `MCU ${genre} • ${year ?? 'Release date unknown'}`
+            description: `MCU ${catalogName} • ${year ?? 'Release date unknown'}`
         };
 
     } catch (err) {
-        console.error(`Row ${index} processing error:`, err.message);
+        console.error(`Row ${index} error:`, err.message);
         return null;
     }
 }
 
+// ─── Sheet Fetcher ────────────────────────────────────────────────────────────
+
+async function fetchCatalog(catalogId) {
+    const catalog = CATALOGS[catalogId];
+    if (!catalog) return [];
+
+    const res  = await fetch(catalog.url);
+    const text = await res.text();
+
+    if (!text.includes("google.visualization.Query.setResponse")) {
+        throw new Error("Invalid Google Sheets response");
+    }
+
+    const json    = JSON.parse(text.substring(47).slice(0, -2));
+    const allRows = json.table.rows;
+
+    // Skip header rows — they have no 4-digit year in column 2
+    const rows = allRows.filter((row) => {
+        const col2 = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
+        return /\d{4}/.test(col2) || col2 === "";
+    });
+
+    const metas = await Promise.all(
+        rows.map((row, index) => processRow(row, index, catalog.name))
+    );
+
+    return metas.filter(Boolean);
+}
+
 // ─── Catalog Handler ──────────────────────────────────────────────────────────
 
-builder.defineCatalogHandler(async ({ extra }) => {
-    const genre = (extra && extra.genre && GENRE_MAP[extra.genre])
-        ? extra.genre
-        : "Chronological";
+builder.defineCatalogHandler(async (args) => {
+    console.log(`[Catalog Request] id="${args.id}"`);
 
-    const sheetUrl = GENRE_MAP[genre];
+    if (!CATALOGS[args.id]) {
+        console.warn(`[Unknown catalog] "${args.id}"`);
+        return { metas: [] };
+    }
 
     try {
-        const res  = await fetch(sheetUrl);
-        const text = await res.text();
-
-        if (!text.includes("google.visualization.Query.setResponse")) {
-            throw new Error("Invalid Google Sheets response");
-        }
-
-        const json    = JSON.parse(text.substring(47).slice(0, -2));
-        const allRows = json.table.rows;
-
-        const rows = allRows.filter((row) => {
-            const col2 = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
-            return /\d{4}/.test(col2) || col2 === "";
-        });
-
-        const metas = await Promise.all(
-            rows.map((row, index) => processRow(row, index, genre))
-        );
-
-        return { metas: metas.filter(Boolean) };
-
+        const metas = await fetchCatalog(args.id);
+        return { metas };
     } catch (error) {
-        console.error("Catalog Handler Error:", error.message);
+        console.error(`Catalog Handler Error [${args.id}]:`, error.message);
         return { metas: [] };
     }
 });
@@ -235,29 +237,19 @@ module.exports = async (req, res) => {
         }
 
         if (url.includes('/catalog/')) {
-            let genre = null;
+            // Path format: /catalog/movie/{catalogId}.json
+            // or with extras: /catalog/movie/{catalogId}/skip=0.json
+            const idMatch = url.match(/\/catalog\/movie\/([^\/\?]+?)(?:\/|\.json)/);
+            const catalogId = idMatch ? decodeURIComponent(idMatch[1]) : null;
 
-            const pathMatch = url.match(/\/genre=([^\/\?&]+)/);
-            if (pathMatch) {
-                genre = decodeURIComponent(pathMatch[1].replace(/\.json$/, ''));
+            if (!catalogId || !CATALOGS[catalogId]) {
+                console.warn(`[Unknown catalog path] "${url}"`);
+                return res.status(200).json({ metas: [] });
             }
 
-            if (!genre) {
-                const qs = url.split('?')[1] || '';
-                genre    = new URLSearchParams(qs).get('genre');
-            }
+            console.log(`[HTTP Catalog Request] catalogId="${catalogId}"`);
 
-            if (!genre || !GENRE_MAP[genre]) genre = "Chronological";
-
-            console.log(`[Catalog Request] genre="${genre}"`);
-
-            const resp = await addonInterface.get(
-                'catalog',
-                'movie',
-                'mcu_master_list',
-                { genre }
-            );
-
+            const resp = await addonInterface.get('catalog', 'movie', catalogId, {});
             return res.status(200).json(resp);
         }
 
@@ -265,6 +257,4 @@ module.exports = async (req, res) => {
 
     } catch (err) {
         console.error("Handler Error:", err.message);
-        return res.status(500).json({ error: "Internal Server Error" });
-    }
-};
+        return res.status(500).json({ error: "Internal Server 
