@@ -15,7 +15,7 @@ const TMDB_LOW_CONFIDENCE_THRESHOLD = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.2.3",
+    version: "3.2.4",
     name: "MCU Ultimate Watchlist",
     description: "Stable MCU list with Year-Aware TMDB Search",
     resources: ["catalog"],
@@ -25,6 +25,9 @@ const manifest = {
             type: "movie",
             id: "mcu_master_list",
             name: "MCU Ultimate",
+            // FIX: "genre" is the special Stremio-recognized extra name.
+            // Stremio renders these as filter tabs in the Discover page.
+            // The SDK parses /genre=X.json from the URL and passes it as args.extra.genre.
             extra: [
                 {
                     name: "genre",
@@ -38,7 +41,7 @@ const manifest = {
 
 const builder = new addonBuilder(manifest);
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function extractYear(dateStr) {
     if (!dateStr) return null;
@@ -47,10 +50,9 @@ function extractYear(dateStr) {
 }
 
 // ─── Title Parser ─────────────────────────────────────────────────────────────
-// Handles all series formats generically without assuming show names.
 
 function parseTitle(title) {
-    // "ShowName Slingshot Episode N" — Slingshot is a sub-series, not a season
+    // "ShowName Slingshot Episode N" — sub-series, treat as Season 1
     const slingshotMatch = title.match(/^(.+?)\s+Slingshot\s+Episode\s+(\d+)/i);
     if (slingshotMatch) {
         return {
@@ -76,15 +78,13 @@ function parseTitle(title) {
 }
 
 // ─── TMDB Search — confidence-aware ──────────────────────────────────────────
-// For MOVIES: use year to disambiguate, retry without year on miss.
-// For SERIES: never filter by year (episode air dates ≠ show premiere year).
-// Confidence is LOW when vote_count < threshold — likely wrong match or promo.
 
 async function getTmdbData(title, isSeries, year) {
     const type = isSeries ? 'tv' : 'movie';
 
     const search = async (withYear) => {
         let url = `https://api.themoviedb.org/3/search/${type}?api_key=${TMDB_KEY}&query=${encodeURIComponent(title)}`;
+        // Only apply year for movies — episode air dates ≠ show premiere year
         if (!isSeries && withYear && year) url += `&primary_release_year=${year}`;
         const res  = await fetch(url);
         const data = await res.json();
@@ -99,18 +99,13 @@ async function getTmdbData(title, isSeries, year) {
             results = await search(false);
         }
 
-        if (results.length === 0) {
-            return { imdbId: null, poster: null, confident: false };
-        }
+        if (results.length === 0) return { imdbId: null, poster: null, confident: false };
 
-        // Sort by vote_count — most stable signal for correct match
         const item = results.sort((a, b) => b.vote_count - a.vote_count)[0];
-
-        // Low vote count = likely wrong match or promo/obscure web content
         const confident = (item.vote_count ?? 0) >= TMDB_LOW_CONFIDENCE_THRESHOLD;
 
         if (!confident) {
-            console.warn(`[LOW CONFIDENCE] "${title}" — top result vote_count: ${item.vote_count}, name: ${item.title || item.name}`);
+            console.warn(`[LOW CONFIDENCE] "${title}" — vote_count: ${item.vote_count}, matched: ${item.title || item.name}`);
             return { imdbId: null, poster: null, confident: false };
         }
 
@@ -122,7 +117,6 @@ async function getTmdbData(title, isSeries, year) {
             poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
             confident: true
         };
-
     } catch (e) {
         console.error(`TMDB Error for "${title}":`, e.message);
         return { imdbId: null, poster: null, confident: false };
@@ -149,23 +143,26 @@ async function processRow(row, index, genre) {
         const { showName, isSeries, season, episode } = parseTitle(rawTitle);
         const tmdb = await getTmdbData(showName, isSeries, year);
 
-        // No confident TMDB match — treat as promo/supplemental content.
-        // Use a placeholder ID so it still appears in the catalog without
-        // risking loading the wrong stream via a bad IMDB ID.
         const baseId = (tmdb.confident && tmdb.imdbId)
             ? tmdb.imdbId
             : `promo_${index}`;
 
         if (!tmdb.confident) {
-            console.log(`[PROMO/UNMATCHED] "${rawTitle}" — shown with placeholder ID`);
+            console.log(`[PROMO/UNMATCHED] "${rawTitle}" — placeholder ID assigned`);
         }
 
+        // Display number is position + 1 based on order in the sheet
+        const num = index + 1;
         let id          = baseId;
-        let displayName = `#${index + 1} ${rawTitle}`;
+        let displayName;
 
         if (isSeries && season && episode) {
-            displayName = `#${index + 1} E:${episode} ${rawTitle}`;
+            // Format: #23 S:2 E:10 Agent Carter Season 2 Episode 10: Hollywood Ending
+            displayName = `#${num} S:${season} E:${episode} ${rawTitle}`;
             id          = `${baseId}:${season}:${episode}`;
+        } else {
+            // Format: #5 Captain America: The First Avenger
+            displayName = `#${num} ${rawTitle}`;
         }
 
         return {
@@ -177,18 +174,21 @@ async function processRow(row, index, genre) {
         };
 
     } catch (err) {
-        console.error(`Row ${index} processing error:`, err.message);
+        console.error(`Row ${index} error:`, err.message);
         return null;
     }
 }
 
 // ─── Catalog Handler ──────────────────────────────────────────────────────────
+// FIX: The SDK already parses the genre from the URL path and passes it as
+// args.extra.genre — no manual URL parsing needed. Just read args.extra.genre.
 
-builder.defineCatalogHandler(async ({ extra }) => {
-    // Validate genre — never let null or unknown value through
-    const genre = (extra && extra.genre && GENRE_MAP[extra.genre])
-        ? extra.genre
+builder.defineCatalogHandler(async (args) => {
+    const genre = (args.extra && args.extra.genre && GENRE_MAP[args.extra.genre])
+        ? args.extra.genre
         : "Chronological";
+
+    console.log(`[Catalog] genre="${genre}"`);
 
     const sheetUrl = GENRE_MAP[genre];
 
@@ -203,7 +203,7 @@ builder.defineCatalogHandler(async ({ extra }) => {
         const json    = JSON.parse(text.substring(47).slice(0, -2));
         const allRows = json.table.rows;
 
-        // Dynamically skip header rows — they have no 4-digit year in column 2
+        // Skip header rows dynamically — headers have no 4-digit year in column 2
         const rows = allRows.filter((row) => {
             const col2 = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
             return /\d{4}/.test(col2) || col2 === "";
@@ -222,6 +222,8 @@ builder.defineCatalogHandler(async ({ extra }) => {
 });
 
 // ─── HTTP / Vercel Handler ────────────────────────────────────────────────────
+// FIX: Use serveHTTP from the SDK for local dev, and a lean Vercel handler
+// for production. The SDK router handles all URL parsing internally.
 
 const addonInterface = builder.getInterface();
 
@@ -237,35 +239,33 @@ module.exports = async (req, res) => {
             return res.status(200).json(addonInterface.manifest);
         }
 
-        // Catalog
+        // Catalog — let the SDK parse the URL properly
+        // Stremio sends: /catalog/movie/mcu_master_list/genre=Chronological.json
         if (url.includes('/catalog/')) {
-            let genre = null;
+            // Extract extra props string from path: "genre=Chronological"
+            // Pattern: /catalog/{type}/{id}/{extraProps}.json
+            const pathMatch = url.match(/\/catalog\/[^/]+\/[^/]+\/([^?]+)\.json/);
+            const extraStr  = pathMatch ? pathMatch[1] : '';
 
-            // Stremio encodes extra params in the path:
-            // /catalog/movie/mcu_master_list/genre=Chronological.json
-            const pathMatch = url.match(/\/genre=([^\/\?&]+)/);
-            if (pathMatch) {
-                genre = decodeURIComponent(pathMatch[1].replace(/\.json$/, ''));
-            }
+            // Parse all key=value pairs from the extra path segment
+            const extra = {};
+            extraStr.split('&').forEach(part => {
+                const [key, val] = part.split('=');
+                if (key && val) extra[decodeURIComponent(key)] = decodeURIComponent(val);
+            });
 
-            // Fallback to query string
-            if (!genre) {
-                const qs = url.split('?')[1] || '';
-                genre    = new URLSearchParams(qs).get('genre');
-            }
+            // Also check query string as fallback
+            const qs = url.split('?')[1] || '';
+            new URLSearchParams(qs).forEach((val, key) => {
+                if (!extra[key]) extra[key] = val;
+            });
 
-            // Final validation
-            if (!genre || !GENRE_MAP[genre]) genre = "Chronological";
+            // Validate genre
+            if (!extra.genre || !GENRE_MAP[extra.genre]) extra.genre = "Chronological";
 
-            console.log(`[Catalog Request] genre="${genre}"`);
+            console.log(`[HTTP] catalog request extra:`, extra);
 
-            const resp = await addonInterface.get(
-                'catalog',
-                'movie',
-                'mcu_master_list',
-                { genre }
-            );
-
+            const resp = await addonInterface.get('catalog', 'movie', 'mcu_master_list', extra);
             return res.status(200).json(resp);
         }
 
