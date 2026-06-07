@@ -26,14 +26,14 @@ const TMDB_LOW_CONFIDENCE  = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.3.5",
+    version: "3.3.6",
     name: "MCU Ultimate Watchlist",
     description: "MCU lists with precise S:X E:Y formatting in perfect order",
     resources: ["catalog"],
-    // Keeping this simple: one type means one unified list in the app.
-    types: ["movie"], 
+    // Registering "Marvel" as a custom type so it gets its own tab
+    types: ["movie", "series", "Marvel"], 
     catalogs: Object.entries(CATALOGS).map(([id, { name }]) => ({
-        type: "movie",
+        type: "Marvel", // Defines the catalog section as "Marvel"
         id,
         name
     }))
@@ -138,32 +138,25 @@ async function processRow(row, index, catalogName) {
         
         let id = baseId;
         let displayName = `#${index + 1} ${rawTitle}`;
-        let behaviorHints;
 
         // SPECIFIC SYNTAX: #Index S:Season E:Episode Original Title
         if (isSeries && season && episode) {
             displayName = `#${index + 1} S:${season} E:${episode} ${rawTitle}`;
             
-            // CRITICAL FIX FOR NUVIO/STREMIO: 
-            // We keep `id` as the base show ID so metadata loads correctly, 
-            // but use `defaultVideoId` to force the player to open the specific episode.
-            id = baseId;
-            behaviorHints = { defaultVideoId: `${baseId}:${season}:${episode}` };
+            // Reverted to give episodes their exact ID format
+            id = baseId.startsWith('promo_') ? baseId : `${baseId}:${season}:${episode}`;
         }
 
         const poster = getEasyRatingsPoster(isSeries, tmdb.tmdbId) || tmdb.poster || DEFAULT_POSTER;
 
-        const metaObj = {
+        return {
             id,
-            type: isSeries ? "series" : "movie",
+            // Keep the item type as 'movie' or 'series' so the app knows how to fetch metadata/streams
+            type: isSeries ? "series" : "movie", 
             name: displayName,
             poster,
             description: `MCU ${catalogName} • ${year ?? 'TBA'}`
         };
-
-        if (behaviorHints) metaObj.behaviorHints = behaviorHints;
-
-        return metaObj;
 
     } catch (err) {
         return null;
@@ -223,9 +216,9 @@ module.exports = async (req, res) => {
         if (url.endsWith('manifest.json')) return res.status(200).json(addonInterface.manifest);
 
         if (url.includes('/catalog/')) {
-            // Flexible regex to catch standard Stremio catalog routing
-            const idMatch = url.match(/\/catalog\/(movie|series|other)\/([^\/\?]+?)(?:\/|\.json)/);
-            const contentType = idMatch ? idMatch[1] : 'movie';
+            // Regex updated to capture ANY custom catalog type dynamically (like "Marvel")
+            const idMatch = url.match(/\/catalog\/([^\/]+)\/([^\/\?]+?)(?:\/|\.json)/);
+            const contentType = idMatch ? decodeURIComponent(idMatch[1]) : null;
             const catalogId = idMatch ? decodeURIComponent(idMatch[2]) : null;
             
             if (!catalogId || !CATALOGS[catalogId]) return res.status(200).json({ metas: [] });
