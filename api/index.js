@@ -26,10 +26,12 @@ const TMDB_LOW_CONFIDENCE  = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.3.7",
+    version: "3.3.9",
     name: "MCU Ultimate Watchlist",
     description: "MCU lists with precise S:X E:Y formatting in perfect order",
-    resources: ["catalog"],
+    // Added "meta" resource so our add-on can intercept metadata clicks
+    resources: ["catalog", "meta"], 
+    idPrefixes: ["tt", "promo"],
     types: ["movie", "series", "Marvel"], 
     catalogs: Object.entries(CATALOGS).map(([id, { name }]) => ({
         type: "Marvel",
@@ -134,34 +136,23 @@ async function processRow(row, index, catalogName) {
         
         let id = baseId;
         let displayName = `#${index + 1} ${rawTitle}`;
-        let behaviorHints = null;
 
-        // SPECIFIC SYNTAX: #Index S:Season E:Episode Original Title
         if (isSeries && season && episode) {
             displayName = `#${index + 1} S:${season} E:${episode} ${rawTitle}`;
-            
-            // Assign the exact base ID to the episode (e.g. tt4154796)
-            id = baseId;
-
-            // Direct Nuvio to the specific episode video inside the main series page
-            if (!baseId.startsWith('promo_')) {
-                behaviorHints = { defaultVideoId: `${baseId}:${season}:${episode}` };
-            }
+            // Give every episode a UNIQUE ID so they ALL show up in the list
+            id = baseId.startsWith('promo_') ? baseId : `${baseId}:${season}:${episode}`;
         }
 
         const poster = getEasyRatingsPoster(isSeries, tmdb.tmdbId) || tmdb.poster || DEFAULT_POSTER;
 
-        const metaObj = {
+        return {
             id,
+            // Keep internal type as movie/series so the interceptor knows what to look up
             type: isSeries ? "series" : "movie", 
             name: displayName,
             poster,
             description: `MCU ${catalogName} • ${year ?? 'TBA'}`
         };
-
-        if (behaviorHints) metaObj.behaviorHints = behaviorHints;
-
-        return metaObj;
 
     } catch (err) {
         return null;
@@ -195,7 +186,7 @@ async function fetchCatalog(catalogId) {
     return metas.filter(Boolean);
 }
 
-// ─── Catalog Handler ──────────────────────────────────────────────────────────
+// ─── Handlers ─────────────────────────────────────────────────────────────────
 
 builder.defineCatalogHandler(async (args) => {
     if (!CATALOGS[args.id]) return { metas: [] };
@@ -204,6 +195,35 @@ builder.defineCatalogHandler(async (args) => {
         return { metas }; 
     } catch (error) {
         return { metas: [] };
+    }
+});
+
+// INTERCEPTOR: Translates unique episode IDs back into standard show data for Nuvio
+builder.defineMetaHandler(async (args) => {
+    try {
+        // Break down tt4154796:1:4 into baseId, season, and episode
+        const [baseId, season, episode] = args.id.split(':');
+        const standardType = season ? 'series' : 'movie';
+        
+        // Fetch the standard show metadata from Cinemeta
+        const res = await fetch(`https://v3-cinemeta.strem.io/meta/${standardType}/${baseId}.json`);
+        const data = await res.json();
+        
+        if (data && data.meta) {
+            const meta = data.meta;
+            // Force the meta ID to match exactly what Nuvio clicked
+            meta.id = args.id;
+            
+            // If it's an episode, tell Nuvio to auto-select that specific episode
+            if (season && episode) {
+                meta.behaviorHints = { defaultVideoId: args.id };
+            }
+            
+            return { meta };
+        }
+        return { meta: { id: args.id, name: "Metadata not found" } };
+    } catch (err) {
+        return { meta: null };
     }
 });
 
@@ -219,6 +239,7 @@ module.exports = async (req, res) => {
         const url = req.url || '';
         if (url.endsWith('manifest.json')) return res.status(200).json(addonInterface.manifest);
 
+        // Route Catalog Requests
         if (url.includes('/catalog/')) {
             const idMatch = url.match(/\/catalog\/([^\/]+)\/([^\/\?]+?)(?:\/|\.json)/);
             const contentType = idMatch ? decodeURIComponent(idMatch[1]) : null;
@@ -229,6 +250,19 @@ module.exports = async (req, res) => {
             const resp = await addonInterface.get('catalog', contentType, catalogId, {});
             return res.status(200).json(resp);
         }
+
+        // Route Meta Requests (Triggered when clicking an episode)
+        if (url.includes('/meta/')) {
+            const idMatch = url.match(/\/meta\/([^\/]+)\/([^\/\?]+?)(?:\/|\.json)/);
+            const contentType = idMatch ? decodeURIComponent(idMatch[1]) : null;
+            const metaId = idMatch ? decodeURIComponent(idMatch[2]) : null;
+            
+            if (!metaId) return res.status(404).json({ error: "Not Found" });
+
+            const resp = await addonInterface.get('meta', contentType, metaId, {});
+            return res.status(200).json(resp);
+        }
+
         return res.status(404).json({ error: "Not Found" });
     } catch (err) {
         return res.status(500).json({ error: "Internal Error" });
