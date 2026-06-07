@@ -26,24 +26,17 @@ const TMDB_LOW_CONFIDENCE  = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.3.4", // Incremented version
+    version: "3.3.5",
     name: "MCU Ultimate Watchlist",
-    description: "MCU lists with precise S:X E:Y formatting",
+    description: "MCU lists with precise S:X E:Y formatting in perfect order",
     resources: ["catalog"],
-    types: ["movie", "series"],
-    // Map catalogs to BOTH "movie" and "series" so Stremio can load them in both sections
-    catalogs: [
-        ...Object.entries(CATALOGS).map(([id, { name }]) => ({
-            type: "movie",
-            id,
-            name
-        })),
-        ...Object.entries(CATALOGS).map(([id, { name }]) => ({
-            type: "series",
-            id,
-            name
-        }))
-    ]
+    // Keeping this simple: one type means one unified list in the app.
+    types: ["movie"], 
+    catalogs: Object.entries(CATALOGS).map(([id, { name }]) => ({
+        type: "movie",
+        id,
+        name
+    }))
 };
 
 const builder = new addonBuilder(manifest);
@@ -56,7 +49,7 @@ function extractYear(dateStr) {
     return match ? match[0] : null;
 }
 
-// Formats the poster link using the requested EasyRatingsDB endpoint structure
+// EasyRatingsDB Poster format
 function getEasyRatingsPoster(isSeries, tmdbId) {
     if (!tmdbId) return null;
     const type = isSeries ? 'tv' : 'movie';
@@ -145,23 +138,32 @@ async function processRow(row, index, catalogName) {
         
         let id = baseId;
         let displayName = `#${index + 1} ${rawTitle}`;
+        let behaviorHints;
 
         // SPECIFIC SYNTAX: #Index S:Season E:Episode Original Title
         if (isSeries && season && episode) {
             displayName = `#${index + 1} S:${season} E:${episode} ${rawTitle}`;
-            id = `${baseId}:${season}:${episode}`;
+            
+            // CRITICAL FIX FOR NUVIO/STREMIO: 
+            // We keep `id` as the base show ID so metadata loads correctly, 
+            // but use `defaultVideoId` to force the player to open the specific episode.
+            id = baseId;
+            behaviorHints = { defaultVideoId: `${baseId}:${season}:${episode}` };
         }
 
-        // Apply new EasyRatings API Poster format, falls back to tmdb poster, then default image
         const poster = getEasyRatingsPoster(isSeries, tmdb.tmdbId) || tmdb.poster || DEFAULT_POSTER;
 
-        return {
+        const metaObj = {
             id,
             type: isSeries ? "series" : "movie",
             name: displayName,
             poster,
             description: `MCU ${catalogName} • ${year ?? 'TBA'}`
         };
+
+        if (behaviorHints) metaObj.behaviorHints = behaviorHints;
+
+        return metaObj;
 
     } catch (err) {
         return null;
@@ -192,7 +194,7 @@ async function fetchCatalog(catalogId) {
         rows.map((row, index) => processRow(row, index, catalog.name))
     );
 
-    return metas.filter(Boolean);
+    return metas.filter(Boolean); // Returns the list exactly in order
 }
 
 // ─── Catalog Handler ──────────────────────────────────────────────────────────
@@ -201,8 +203,8 @@ builder.defineCatalogHandler(async (args) => {
     if (!CATALOGS[args.id]) return { metas: [] };
     try {
         const metas = await fetchCatalog(args.id);
-        // Filter catalog metas depending on whether the catalog requested is for "movie" or "series"
-        return { metas: metas.filter(meta => meta.type === args.type) };
+        // Returning metas directly WITHOUT filtering, preserving your exact sheet order
+        return { metas }; 
     } catch (error) {
         return { metas: [] };
     }
@@ -221,9 +223,9 @@ module.exports = async (req, res) => {
         if (url.endsWith('manifest.json')) return res.status(200).json(addonInterface.manifest);
 
         if (url.includes('/catalog/')) {
-            // Regex updated to accept both /movie/ and /series/ types
-            const idMatch = url.match(/\/catalog\/(movie|series)\/([^\/\?]+?)(?:\/|\.json)/);
-            const contentType = idMatch ? idMatch[1] : null;
+            // Flexible regex to catch standard Stremio catalog routing
+            const idMatch = url.match(/\/catalog\/(movie|series|other)\/([^\/\?]+?)(?:\/|\.json)/);
+            const contentType = idMatch ? idMatch[1] : 'movie';
             const catalogId = idMatch ? decodeURIComponent(idMatch[2]) : null;
             
             if (!catalogId || !CATALOGS[catalogId]) return res.status(200).json({ metas: [] });
