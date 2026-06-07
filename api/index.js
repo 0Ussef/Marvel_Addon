@@ -19,7 +19,6 @@ const CATALOGS = {
 };
 
 const TMDB_KEY             = "aca5177e4921fcdcb0ece67dc17b5bd0";
-const RPDB_ENDPOINT        = "https://api.ratingposterdb.com/t0-free-rpdb-rounded-blocks/imdb/poster-default";
 const DEFAULT_POSTER       = "https://platform.polygon.com/wp-content/uploads/sites/2/chorus/uploads/chorus_asset/file/16181745/marvel_studios_logo.jpg";
 const TMDB_LOW_CONFIDENCE  = 10;
 
@@ -27,16 +26,24 @@ const TMDB_LOW_CONFIDENCE  = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.3.3",
+    version: "3.3.4", // Incremented version
     name: "MCU Ultimate Watchlist",
     description: "MCU lists with precise S:X E:Y formatting",
     resources: ["catalog"],
     types: ["movie", "series"],
-    catalogs: Object.entries(CATALOGS).map(([id, { name }]) => ({
-        type: "movie",
-        id,
-        name
-    }))
+    // Map catalogs to BOTH "movie" and "series" so Stremio can load them in both sections
+    catalogs: [
+        ...Object.entries(CATALOGS).map(([id, { name }]) => ({
+            type: "movie",
+            id,
+            name
+        })),
+        ...Object.entries(CATALOGS).map(([id, { name }]) => ({
+            type: "series",
+            id,
+            name
+        }))
+    ]
 };
 
 const builder = new addonBuilder(manifest);
@@ -49,9 +56,11 @@ function extractYear(dateStr) {
     return match ? match[0] : null;
 }
 
-function getRpdbPoster(imdbId) {
-    if (!imdbId || imdbId.startsWith('promo_')) return null;
-    return `${RPDB_ENDPOINT}/${imdbId}.jpg`;
+// Formats the poster link using the requested EasyRatingsDB endpoint structure
+function getEasyRatingsPoster(isSeries, tmdbId) {
+    if (!tmdbId) return null;
+    const type = isSeries ? 'tv' : 'movie';
+    return `https://easyratingsdb.com/Tk-629ea1caa0bf7de91711135f7d1d47632f3e402b396c4d83/poster/tmdb:${type}:${tmdbId}.jpg`;
 }
 
 // ─── Title Parser ─────────────────────────────────────────────────────────────
@@ -98,23 +107,24 @@ async function getTmdbData(title, isSeries, year) {
     try {
         let results = await search(true);
         if (!isSeries && results.length === 0 && year) results = await search(false);
-        if (results.length === 0) return { imdbId: null, poster: null, confident: false };
+        if (results.length === 0) return { imdbId: null, tmdbId: null, poster: null, confident: false };
 
         const item      = results.sort((a, b) => b.vote_count - a.vote_count)[0];
         const confident = (item.vote_count ?? 0) >= TMDB_LOW_CONFIDENCE;
 
-        if (!confident) return { imdbId: null, poster: null, confident: false };
+        if (!confident) return { imdbId: null, tmdbId: null, poster: null, confident: false };
 
         const extRes  = await fetch(`https://api.themoviedb.org/3/${type}/${item.id}/external_ids?api_key=${TMDB_KEY}`);
         const extData = await extRes.json();
 
         return {
             imdbId: extData.imdb_id || null,
+            tmdbId: item.id || null,
             poster: item.poster_path ? `https://image.tmdb.org/t/p/w500${item.poster_path}` : null,
             confident: true
         };
     } catch (e) {
-        return { imdbId: null, poster: null, confident: false };
+        return { imdbId: null, tmdbId: null, poster: null, confident: false };
     }
 }
 
@@ -133,7 +143,6 @@ async function processRow(row, index, catalogName) {
 
         const baseId = (tmdb.confident && tmdb.imdbId) ? tmdb.imdbId : `promo_${index}`;
         
-        // Base numbering
         let id = baseId;
         let displayName = `#${index + 1} ${rawTitle}`;
 
@@ -143,7 +152,8 @@ async function processRow(row, index, catalogName) {
             id = `${baseId}:${season}:${episode}`;
         }
 
-        const poster = getRpdbPoster(tmdb.imdbId) || tmdb.poster || DEFAULT_POSTER;
+        // Apply new EasyRatings API Poster format, falls back to tmdb poster, then default image
+        const poster = getEasyRatingsPoster(isSeries, tmdb.tmdbId) || tmdb.poster || DEFAULT_POSTER;
 
         return {
             id,
@@ -169,7 +179,6 @@ async function fetchCatalog(catalogId) {
     const json = JSON.parse(text.substring(47).slice(0, -2));
     const allRows = json.table.rows;
 
-    // Filter logic ensures index 0 is truly the first movie/episode
     const rows = allRows.filter((row) => {
         const title = row.c?.[1]?.v?.toString().trim() || "";
         const date  = row.c?.[2] ? (row.c[2].f || row.c[2].v?.toString() || "") : "";
@@ -192,7 +201,8 @@ builder.defineCatalogHandler(async (args) => {
     if (!CATALOGS[args.id]) return { metas: [] };
     try {
         const metas = await fetchCatalog(args.id);
-        return { metas };
+        // Filter catalog metas depending on whether the catalog requested is for "movie" or "series"
+        return { metas: metas.filter(meta => meta.type === args.type) };
     } catch (error) {
         return { metas: [] };
     }
@@ -211,11 +221,14 @@ module.exports = async (req, res) => {
         if (url.endsWith('manifest.json')) return res.status(200).json(addonInterface.manifest);
 
         if (url.includes('/catalog/')) {
-            const idMatch = url.match(/\/catalog\/movie\/([^\/\?]+?)(?:\/|\.json)/);
-            const catalogId = idMatch ? decodeURIComponent(idMatch[1]) : null;
+            // Regex updated to accept both /movie/ and /series/ types
+            const idMatch = url.match(/\/catalog\/(movie|series)\/([^\/\?]+?)(?:\/|\.json)/);
+            const contentType = idMatch ? idMatch[1] : null;
+            const catalogId = idMatch ? decodeURIComponent(idMatch[2]) : null;
+            
             if (!catalogId || !CATALOGS[catalogId]) return res.status(200).json({ metas: [] });
 
-            const resp = await addonInterface.get('catalog', 'movie', catalogId, {});
+            const resp = await addonInterface.get('catalog', contentType, catalogId, {});
             return res.status(200).json(resp);
         }
         return res.status(404).json({ error: "Not Found" });
