@@ -26,14 +26,13 @@ const TMDB_LOW_CONFIDENCE  = 10;
 
 const manifest = {
     id: "org.mcu.improved.search.stable",
-    version: "3.3.6",
+    version: "3.3.7",
     name: "MCU Ultimate Watchlist",
     description: "MCU lists with precise S:X E:Y formatting in perfect order",
     resources: ["catalog"],
-    // Registering "Marvel" as a custom type so it gets its own tab
     types: ["movie", "series", "Marvel"], 
     catalogs: Object.entries(CATALOGS).map(([id, { name }]) => ({
-        type: "Marvel", // Defines the catalog section as "Marvel"
+        type: "Marvel",
         id,
         name
     }))
@@ -49,7 +48,6 @@ function extractYear(dateStr) {
     return match ? match[0] : null;
 }
 
-// EasyRatingsDB Poster format
 function getEasyRatingsPoster(isSeries, tmdbId) {
     if (!tmdbId) return null;
     const type = isSeries ? 'tv' : 'movie';
@@ -59,7 +57,6 @@ function getEasyRatingsPoster(isSeries, tmdbId) {
 // ─── Title Parser ─────────────────────────────────────────────────────────────
 
 function parseTitle(title) {
-    // Check for "Slingshot" style episodes
     const slingshotMatch = title.match(/^(.+?)\s+Slingshot\s+Episode\s+(\d+)/i);
     if (slingshotMatch) {
         return {
@@ -70,7 +67,6 @@ function parseTitle(title) {
         };
     }
 
-    // Check for "Season X Episode Y" style titles
     const epMatch = title.match(/^(.+?)\s+Season\s+(\d+)\s+Episode\s+(\d+)/i);
     if (epMatch) {
         return {
@@ -138,25 +134,34 @@ async function processRow(row, index, catalogName) {
         
         let id = baseId;
         let displayName = `#${index + 1} ${rawTitle}`;
+        let behaviorHints = null;
 
         // SPECIFIC SYNTAX: #Index S:Season E:Episode Original Title
         if (isSeries && season && episode) {
             displayName = `#${index + 1} S:${season} E:${episode} ${rawTitle}`;
             
-            // Reverted to give episodes their exact ID format
-            id = baseId.startsWith('promo_') ? baseId : `${baseId}:${season}:${episode}`;
+            // Assign the exact base ID to the episode (e.g. tt4154796)
+            id = baseId;
+
+            // Direct Nuvio to the specific episode video inside the main series page
+            if (!baseId.startsWith('promo_')) {
+                behaviorHints = { defaultVideoId: `${baseId}:${season}:${episode}` };
+            }
         }
 
         const poster = getEasyRatingsPoster(isSeries, tmdb.tmdbId) || tmdb.poster || DEFAULT_POSTER;
 
-        return {
+        const metaObj = {
             id,
-            // Keep the item type as 'movie' or 'series' so the app knows how to fetch metadata/streams
             type: isSeries ? "series" : "movie", 
             name: displayName,
             poster,
             description: `MCU ${catalogName} • ${year ?? 'TBA'}`
         };
+
+        if (behaviorHints) metaObj.behaviorHints = behaviorHints;
+
+        return metaObj;
 
     } catch (err) {
         return null;
@@ -187,7 +192,7 @@ async function fetchCatalog(catalogId) {
         rows.map((row, index) => processRow(row, index, catalog.name))
     );
 
-    return metas.filter(Boolean); // Returns the list exactly in order
+    return metas.filter(Boolean);
 }
 
 // ─── Catalog Handler ──────────────────────────────────────────────────────────
@@ -196,7 +201,6 @@ builder.defineCatalogHandler(async (args) => {
     if (!CATALOGS[args.id]) return { metas: [] };
     try {
         const metas = await fetchCatalog(args.id);
-        // Returning metas directly WITHOUT filtering, preserving your exact sheet order
         return { metas }; 
     } catch (error) {
         return { metas: [] };
@@ -216,7 +220,6 @@ module.exports = async (req, res) => {
         if (url.endsWith('manifest.json')) return res.status(200).json(addonInterface.manifest);
 
         if (url.includes('/catalog/')) {
-            // Regex updated to capture ANY custom catalog type dynamically (like "Marvel")
             const idMatch = url.match(/\/catalog\/([^\/]+)\/([^\/\?]+?)(?:\/|\.json)/);
             const contentType = idMatch ? decodeURIComponent(idMatch[1]) : null;
             const catalogId = idMatch ? decodeURIComponent(idMatch[2]) : null;
